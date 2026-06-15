@@ -95,6 +95,7 @@ class MetalLayer: CAMetalLayer {
         super.init()
 
         pixelFormat = .rgba16Float
+        wantsExtendedDynamicRangeContent = true
         previousColorspace = colorspace
         backgroundColor = NSColor.black.cgColor
     }
