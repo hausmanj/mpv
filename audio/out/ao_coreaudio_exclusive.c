@@ -83,6 +83,15 @@ struct priv {
 
     atomic_bool reload_requested;
 
+    // True only while the device IO proc is running (between .start and .reset).
+    // The property listener is installed and removed in sync with this state so
+    // that device-change notifications queued during init (hog-mode acquisition,
+    // physical-format negotiation via ca_change_physical_format_sync) are never
+    // delivered to the callback. Those transient changes would otherwise trigger
+    // a spurious ao_request_reload that resets audio_status mid-startup and
+    // prevents playback from beginning without a seek.
+    bool listener_installed;
+
     uint64_t hw_latency_ns;
 };
 
@@ -391,9 +400,6 @@ static int init(struct ao *ao)
     p->hw_latency_ns = ca_get_device_latency_ns(ao, p->device);
     MP_VERBOSE(ao, "base latency: %lld nanoseconds\n", p->hw_latency_ns);
 
-    err = enable_property_listener(ao, true);
-    CHECK_CA_ERROR("cannot install format change listener during init");
-
     err = AudioDeviceCreateIOProcID(p->device,
                                     (AudioDeviceIOProc)render_cb_compressed,
                                     (void *)ao,
@@ -403,8 +409,6 @@ static int init(struct ao *ao)
     return CONTROL_TRUE;
 
 coreaudio_error:
-    err = enable_property_listener(ao, false);
-    CHECK_CA_WARN("can't remove format change listener");
     err = ca_unlock_device(p->device, &p->hog_pid);
     CHECK_CA_WARN("can't release hog mode");
 coreaudio_error_nounlock:
@@ -416,8 +420,11 @@ static void uninit(struct ao *ao)
     struct priv *p = ao->priv;
     OSStatus err = noErr;
 
-    err = enable_property_listener(ao, false);
-    CHECK_CA_WARN("can't remove device listener, this may cause a crash");
+    if (p->listener_installed) {
+        err = enable_property_listener(ao, false);
+        CHECK_CA_WARN("can't remove device listener, this may cause a crash");
+        p->listener_installed = false;
+    }
 
     err = AudioDeviceStop(p->device, p->render_cb);
     CHECK_CA_WARN("failed to stop audio device");
@@ -438,16 +445,41 @@ static void uninit(struct ao *ao)
 static void audio_pause(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    OSStatus err;
 
-    OSStatus err = AudioDeviceStop(p->device, p->render_cb);
+    if (p->listener_installed) {
+        err = enable_property_listener(ao, false);
+        CHECK_CA_WARN("can't remove device listener on pause");
+        p->listener_installed = false;
+    }
+
+    err = AudioDeviceStop(p->device, p->render_cb);
     CHECK_CA_WARN("can't stop audio device");
 }
 
 static void audio_resume(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    OSStatus err;
 
-    OSStatus err = AudioDeviceStart(p->device, p->render_cb);
+    if (!p->listener_installed) {
+        err = enable_property_listener(ao, true);
+        CHECK_CA_WARN("can't install device listener on resume");
+        if (err == noErr) {
+            // Hog mode means any format drift since init is from our own
+            // operations; re-sync baseline so those queued notifications
+            // don't trigger a mismatch-reload and restart the SPDIF retry loop.
+            AudioStreamBasicDescription f = {0};
+            if (CA_GET(p->stream, kAudioStreamPropertyVirtualFormat, &f) == noErr
+                    && !ca_asbd_equals(&p->stream_asbd, &f)) {
+                MP_VERBOSE(ao, "virtual format settled; syncing baseline\n");
+                p->stream_asbd = f;
+            }
+            p->listener_installed = true;
+        }
+    }
+
+    err = AudioDeviceStart(p->device, p->render_cb);
     CHECK_CA_WARN("can't start audio device");
 }
 
